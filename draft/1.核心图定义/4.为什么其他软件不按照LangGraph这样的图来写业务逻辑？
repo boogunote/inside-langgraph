@@ -261,3 +261,88 @@ BPMN 则是：
 [19](https://langchain-ai.github.io/langgraphjs/concepts/low_level/)
 [20](https://www.reddit.com/r/LangChain/comments/1cn7cjy/changing_state_attributes_in_langgraph/)
 [21](https://www.ibm.com/think/topics/langgraph)
+
+用一个“Supervisor 多智能体协作”的例子来对比 BPMN 和 LangGraph，会比较直观。[1][2]
+
+## 场景描述（两阶段任务）
+
+用户问：“查一下 2024 年美国和纽约州的 GDP，各是多少？纽约州占美国的百分之多少？”  
+- 需要先用 research agent 上网查两个 GDP 数。  
+- 再用 math agent 做除法算百分比。  
+- 由 supervisor 决定什么时候把任务交给谁，整个对话中可能多次往返调度。[3][1]
+
+## LangGraph 图长什么样
+
+在 LangGraph 教程里，这个多 Agent 系统大致是这样：  
+- State：一个 `MessagesState`，里面就是 messages 历史，对 research、math、supervisor 共享。[4][1]
+- 节点：  
+  - `supervisor` 节点：一个 LLM，看到当前 messages，决定调用 `transfer_to_research_agent` 或 `transfer_to_math_agent` 这类 handoff tool。[1]
+  - `research_agent` 节点：一个带 Tavily 搜索工具的 ReAct agent，自己内部可能多轮调用搜索工具，最后返回到 supervisor。[5][3]
+  - `math_agent` 节点：一个带 add/multiply/divide 工具的 ReAct agent，自己内部多次工具调用，最后返回到 supervisor。[3]
+- 边：  
+  - `START -> supervisor`  
+  - `supervisor -> research_agent`  
+  - `supervisor -> math_agent`  
+  - `research_agent -> supervisor`  
+  - `math_agent -> supervisor`  
+  最终在某次 supervisor 决定“回答够了”，走 `supervisor -> END`。[1]
+
+特点：  
+- “什么时候叫 research、什么时候叫 math、是否再次叫 research 复查”全部在 supervisor 节点内部由 LLM + 代码决定，图上不需要画所有具体策略分支。[6][1]
+- research/math 节点内部的 ReAct 循环（多次工具调用）完全隐藏在节点里，图上只看见一个节点，复杂度在代码里。[7][5]
+
+## 同样逻辑用 BPMN 要怎么画
+
+如果强行用标准 BPMN，把同样协作画出来，大致需要：  
+- Pools/Lanes：  
+  - 一条 Lane：Supervisor。  
+  - 一条 Lane：Research Agent。  
+  - 一条 Lane：Math Agent。[8]
+- 活动与消息：  
+  - Supervisor Lane 里有多个任务：  
+    - 分析用户请求的任务。  
+    - 决定“发给 research 还是 math”的任务。  
+  - Research Lane 里：接收任务、执行查询、返回结果的任务。  
+  - Math Lane 里：接收任务、计算百分比、返回结果的任务。  
+  - 各 Lane 之间用消息任务或消息中间事件表示 handoff（Supervisor -> Research / Math、Research / Math -> Supervisor）。[9][8]
+- 网关和循环：  
+  - Supervisor 要有一个网关，根据条件分支：  
+    - 走向“发给 Research”分支。  
+    - 或“发给 Math”分支。  
+    - 或“结束并回复用户”。  
+  - 如果允许多轮来回（比如先 Research，再 Math，再可能重查 Research），需要：  
+    - 在网关下方再做环回的顺序流，将控制流重新导回上方决策点。  
+    - 每一次返回结果后都回到同一个网关节点，再次判断下一步。[9]
+
+这样会出现的情况：  
+- 图上有多条消息线（Supervisor <-> Research、Supervisor <-> Math）、多个网关、多个循环箭头，协作策略“散落在”各个网关的条件表达式里，而不是集中在一个节点中。[10][9]
+- 如果 Supervisor 的策略从“先 research 再 math”变成“有时直接 math，有时先 math 后 research”，需要改 BPMN 图结构（新分支、新网关或新条件），这属于“结构级变更”。[11][8]
+- 但在 LangGraph 中，多数时候只改 supervisor prompt / 逻辑函数，不用改图结构，图还是那 3 个节点、几条边。[4][1]
+
+## 针对这个例子的关键差异总结
+
+| 维度          | LangGraph Supervisor 多 Agent | 纯 BPMN 表达同一协作 |
+|---------------|------------------------------|----------------------|
+| 参与者建模    | 3 个节点：supervisor、research、math，共享一个 State。[4][1] | 至少 3 条泳道 + 多个任务节点 + 消息线。[8] |
+| 调度逻辑位置  | 集中在 supervisor 节点里，由 LLM / 代码在运行时决策。[6][12] | 分散在多个网关 + 边条件 + Lane 之间的消息流里。[9][10] |
+| 循环和多轮交互 | 图上只画“agent -> supervisor -> agent”的环，循环次数与策略都在代码里。[4][1] | 需要显式画环回流、可能多个网关；复杂度随着策略增加快速膨胀。[9][11] |
+| Agent 内部 ReAct | 隐藏在节点内部，图不关心工具调用细节。[7][5] | 若要在 BPMN 中可视化，也得画成子流程/子图，再添一层复杂度。[9][11] |
+| 动态/不确定性行为 | 自然接受 LLM 决定下一步（条件函数 / tool 调度），图保持稳定。[4][6] | BPMN 偏静态结构，不擅长“条件本身是 LLM 决策”的高度动态流程，需要脚本和模型扩展。[13][10] |
+
+这个例子本质展示的是：  
+- **LangGraph** 把“多 Agent 调度 + 循环 + 柔性条件”看作“有状态的可编程图”，图很瘦，策略在代码和模型里。  
+- **BPMN** 强调“业务友好 + 静态结构清晰”，一旦套用在这种高动态、多轮 Agent 协作上，元素数量和连接会迅速爆炸，从而降低可读性和可维护性。
+
+[1](https://langchain-ai.github.io/langgraph/tutorials/multi_agent/agent_supervisor/)
+[2](https://www.ibm.com/think/topics/langgraph)
+[3](https://blog.kinto-technologies.com/posts/2025-02-28-building-Multi-Agent-system-by-using-langgraph-supervisor/)
+[4](https://langchain-ai.github.io/langgraph/concepts/low_level/)
+[5](https://www.gettingstarted.ai/langgraph-tutorial-with-example/)
+[6](https://www.youtube.com/watch?v=Xgyk7Qtmf8s)
+[7](https://realpython.com/langgraph-python/)
+[8](https://camunda.com/bpmn/reference/)
+[9](https://docs.camunda.io/docs/components/concepts/workflow-patterns/)
+[10](https://modeling-languages.com/modeling-human-agent-collaborative-workflows-extending-bpmn/)
+[11](https://tynerblain.com/blog/2006/08/02/bpmn-subprocesses/)
+[12](https://dev.to/sreeni5018/building-multi-agent-systems-with-langgraph-supervisor-138i)
+[13](https://arxiv.org/html/2412.05958v1)
